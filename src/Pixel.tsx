@@ -4,6 +4,7 @@ import styles from './Pixel.module.scss' ;
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { LoadModel , GetPlayerController } from './Loader.ts'; 
 import GUI from 'lil-gui' ; 
+import Interaction from '../src/assets/Images/Interaction.png' ; 
 import { PlayerController } from "./Controller.ts";
 
 
@@ -96,6 +97,15 @@ export default function Pixel()
   }, [ canInteract]) ; 
 
   return(
-    <div ref={ ContainerRef } className={styles.container}/> 
+    <>
+      { canInteract.interactionEnabled && (
+      <div className={styles.interactionContainer}>
+        <div className={styles.interactionPrompt}>
+            <img src={Interaction } className={styles.interactionPNG}/>
+        </div>
+      </div>
+      )}
+      <div ref={ ContainerRef } className={styles.container}/>
+    </>
   )
 }
