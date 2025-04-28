@@ -1,0 +1,412 @@
+import { useState, useEffect, useRef } from "react";
+import * as THREE from 'three';
+import styles from './Pixel.module.scss';
+import GUI from 'lil-gui';
+import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer';
+import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass';
+import { Pass, FullScreenQuad } from "three/examples/jsm/postprocessing/Pass"
+
+class PixelatePass extends Pass {
+  fsQuad: any;
+  resolution: THREE.Vector2;
+  
+  constructor(resolution: THREE.Vector2) {
+    super();
+    this.resolution = resolution;
+    this.fsQuad = new FullScreenQuad(this.material());
+  }
+  
+  render(
+    renderer: THREE.WebGLRenderer,
+    writeBuffer: THREE.WebGLRenderTarget,
+    readBuffer: THREE.WebGLRenderTarget
+  ) {
+    // @ts-ignore
+    const uniforms = this.fsQuad.material.uniforms;
+    uniforms.tDiffuse.value = readBuffer.texture;
+    
+    if (this.renderToScreen) {
+      renderer.setRenderTarget(null);
+    } else {
+      renderer.setRenderTarget(writeBuffer);
+      if (this.clear) renderer.clear();
+    }
+    
+    this.fsQuad.render(renderer);
+  }
+  
+  material() {
+    return new THREE.ShaderMaterial({
+      uniforms: {
+        tDiffuse: { value: null },
+        resolution: {
+          value: new THREE.Vector4(
+            this.resolution.x,
+            this.resolution.y,
+            1 / this.resolution.x,
+            1 / this.resolution.y,
+          )
+        }
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: `
+        uniform sampler2D tDiffuse;
+        uniform vec4 resolution;
+        varying vec2 vUv;
+        void main() {
+          vec2 iuv = (floor(resolution.xy * vUv) + 0.5) * resolution.zw;
+          vec4 texel = texture2D(tDiffuse, iuv);
+          gl_FragColor = texel;
+        }
+      `
+    });
+  }
+}
+
+class RenderPixelatedPass extends Pass {
+  fsQuad: any;
+  resolution: THREE.Vector2;
+  scene: THREE.Scene;
+  camera: THREE.Camera;
+  rgbRenderTarget: THREE.WebGLRenderTarget;
+  normalRenderTarget: THREE.WebGLRenderTarget;
+  normalMaterial: THREE.Material;
+  
+  constructor(resolution: THREE.Vector2, scene: THREE.Scene, camera: THREE.Camera) {
+    super();
+    this.resolution = resolution;
+    this.fsQuad = new FullScreenQuad(this.material());
+    this.scene = scene;
+    this.camera = camera;
+    
+    this.rgbRenderTarget = this.pixelRenderTarget(resolution, THREE.RGBAFormat, true);
+    this.normalRenderTarget = this.pixelRenderTarget(resolution, THREE.RGBFormat, false);
+    
+    this.normalMaterial = new THREE.MeshNormalMaterial();
+  }
+  
+  render(
+    renderer: THREE.WebGLRenderer,
+    writeBuffer: THREE.WebGLRenderTarget
+  ) {
+    renderer.setRenderTarget(this.rgbRenderTarget);
+    renderer.render(this.scene, this.camera);
+    
+    const overrideMaterial_old = this.scene.overrideMaterial;
+    renderer.setRenderTarget(this.normalRenderTarget);
+    this.scene.overrideMaterial = this.normalMaterial;
+    renderer.render(this.scene, this.camera);
+    this.scene.overrideMaterial = overrideMaterial_old;
+    
+    // @ts-ignore
+    const uniforms = this.fsQuad.material.uniforms;
+    uniforms.tDiffuse.value = this.rgbRenderTarget.texture;
+    uniforms.tDepth.value = this.rgbRenderTarget.depthTexture;
+    uniforms.tNormal.value = this.normalRenderTarget.texture;
+    
+    if (this.renderToScreen) {
+      renderer.setRenderTarget(null);
+    } else {
+      renderer.setRenderTarget(writeBuffer);
+      if (this.clear) renderer.clear();
+    }
+    
+    this.fsQuad.render(renderer);
+  }
+  
+  pixelRenderTarget(resolution: THREE.Vector2, pixelFormat: THREE.PixelFormat, depthTexture: boolean) {
+    const renderTarget = new THREE.WebGLRenderTarget(
+      resolution.x, resolution.y,
+      !depthTexture ?
+        undefined
+        : {
+          depthTexture: new THREE.DepthTexture(
+            resolution.x,
+            resolution.y
+          ),
+          depthBuffer: true
+        }
+    );
+    renderTarget.texture.format = pixelFormat;
+    renderTarget.texture.minFilter = THREE.NearestFilter;
+    renderTarget.texture.magFilter = THREE.NearestFilter;
+    renderTarget.texture.generateMipmaps = false;
+    renderTarget.stencilBuffer = false;
+    return renderTarget;
+  }
+  
+  material() {
+    return new THREE.ShaderMaterial({
+      uniforms: {
+        tDiffuse: { value: null },
+        tDepth: { value: null },
+        tNormal: { value: null },
+        resolution: {
+          value: new THREE.Vector4(
+            this.resolution.x,
+            this.resolution.y,
+            1 / this.resolution.x,
+            1 / this.resolution.y,
+          )
+        }
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() {
+          vUv = uv;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: `
+        uniform sampler2D tDiffuse;
+        uniform sampler2D tDepth;
+        uniform sampler2D tNormal;
+        uniform vec4 resolution;
+        varying vec2 vUv;
+
+        float getDepth(int x, int y) {
+          return texture2D(tDepth, vUv + vec2(x, y) * resolution.zw).r;
+        }
+
+        vec3 getNormal(int x, int y) {
+          return texture2D(tNormal, vUv + vec2(x, y) * resolution.zw).rgb * 2.0 - 1.0;
+        }
+
+        float neighborNormalEdgeIndicator(int x, int y, float depth, vec3 normal) {
+          float depthDiff = getDepth(x, y) - depth;
+          
+          // Edge pixels should yield to faces closer to the bias direction.
+          vec3 normalEdgeBias = vec3(1., 1., 1.); // This should probably be a parameter.
+          float normalDiff = dot(normal - getNormal(x, y), normalEdgeBias);
+          float normalIndicator = clamp(smoothstep(-.01, .01, normalDiff), 0.0, 1.0);
+          
+          // Only the shallower pixel should detect the normal edge.
+          float depthIndicator = clamp(sign(depthDiff * .25 + .0025), 0.0, 1.0);
+
+          return distance(normal, getNormal(x, y)) * depthIndicator * normalIndicator;
+        }
+
+        float depthEdgeIndicator() {
+          float depth = getDepth(0, 0);
+          vec3 normal = getNormal(0, 0);
+          float diff = 0.0;
+          diff += clamp(getDepth(1, 0) - depth, 0.0, 1.0);
+          diff += clamp(getDepth(-1, 0) - depth, 0.0, 1.0);
+          diff += clamp(getDepth(0, 1) - depth, 0.0, 1.0);
+          diff += clamp(getDepth(0, -1) - depth, 0.0, 1.0);
+          return floor(smoothstep(0.01, 0.02, diff) * 2.) / 2.;
+        }
+
+        float normalEdgeIndicator() {
+          float depth = getDepth(0, 0);
+          vec3 normal = getNormal(0, 0);
+          
+          float indicator = 0.0;
+
+          indicator += neighborNormalEdgeIndicator(0, -1, depth, normal);
+          indicator += neighborNormalEdgeIndicator(0, 1, depth, normal);
+          indicator += neighborNormalEdgeIndicator(-1, 0, depth, normal);
+          indicator += neighborNormalEdgeIndicator(1, 0, depth, normal);
+
+          return step(0.1, indicator);
+        }
+
+        float lum(vec4 color) {
+          vec4 weights = vec4(.2126, .7152, .0722, .0);
+          return dot(color, weights);
+        }
+
+        float smoothSign(float x, float radius) {
+          return smoothstep(-radius, radius, x) * 2.0 - 1.0;
+        }
+
+        void main() {
+          vec4 texel = texture2D(tDiffuse, vUv);
+
+          float tLum = lum(texel);
+          float normalEdgeCoefficient = .3;
+          float depthEdgeCoefficient = .4;
+
+          float dei = depthEdgeIndicator();
+          float nei = normalEdgeIndicator();
+
+          float coefficient = dei > 0.0 ? (1.0 - depthEdgeCoefficient * dei) : (1.0 + normalEdgeCoefficient * nei);
+
+          gl_FragColor = texel * coefficient;
+        }
+      `
+    });
+  }
+}
+
+export default function Pixel() {
+  const containerRef = useRef(null);
+  const gui = new GUI();
+  const folder = gui.addFolder('Plane');
+  
+  const camera = {
+    pX: -11,
+    pY: 7,
+    pZ: 10,
+    rX: -0.45,
+    rY: -0.77,
+    rZ: -0.328,
+  };
+  
+  const position = {
+    x: 0,
+    y: 0,
+    z: 0,
+  };
+  
+  const pixelation = {
+    pixelSize: 3, 
+  };
+  
+  gui.add(camera, 'pX', -100, 100, 1);
+  gui.add(camera, 'pY', -100, 100, 1);
+  gui.add(camera, 'pZ', -100, 500, 1);
+  gui.add(camera, 'rX', -1, 1);
+  gui.add(camera, 'rY', -1, 1);
+  gui.add(camera, 'rZ', -1, 1);
+  folder.add(position, 'x', -1, 1);
+  folder.add(position, 'y', -1, 1);
+  folder.add(position, 'z', -1, 1);
+  gui.add(pixelation, 'pixelSize', 1, 20, 1).onChange((value: number) => {
+    if (window.composer && window.renderResolution) {
+      window.renderResolution.set(
+        Math.floor(window.innerWidth / value),
+        Math.floor(window.innerHeight / value)
+      );
+      
+      // Re-create the render passes with the new resolution
+      setupPixelationPasses();
+    }
+  });
+  
+  function setupPixelationPasses() {
+    if (!window.scene || !window.camera || !window.renderer || !window.renderResolution) return;
+    
+    // Create new composer
+    window.composer = new EffectComposer(window.renderer);
+    
+    // Add render pixelated pass
+    const renderPixelatedPass = new RenderPixelatedPass(window.renderResolution, window.scene, window.camera);
+    window.composer.addPass(renderPixelatedPass);
+    
+    // Add pixelate pass
+    const pixelatePass = new PixelatePass(window.renderResolution);
+    window.composer.addPass(pixelatePass);
+  }
+  
+  useEffect(() => {
+    // Declare these objects on the window so they can be accessed in other functions
+    window.camera = new THREE.OrthographicCamera(-16, 16, 9, -9, 0.1, 10000);
+    window.renderer = new THREE.WebGLRenderer({ antialias: false });
+    window.scene = new THREE.Scene();
+    
+    const screenResolution = new THREE.Vector2(window.innerWidth, window.innerHeight);
+    window.renderResolution = screenResolution.clone().divideScalar(pixelation.pixelSize);
+    window.renderResolution.x = Math.floor(window.renderResolution.x);
+    window.renderResolution.y = Math.floor(window.renderResolution.y);
+    
+    const geometry = new THREE.BoxGeometry();
+    const material = new THREE.MeshPhongMaterial({ color: 0x00ff00 });
+    const cube = new THREE.Mesh(geometry, material);
+    
+    const planeGeometry = new THREE.BoxGeometry(10, 0.1, 10);
+    const planeMat = new THREE.MeshPhongMaterial({ color: 0xFF0000 });
+    const planeMesh = new THREE.Mesh(planeGeometry, planeMat);
+    
+    const axesHelper = new THREE.AxesHelper(5);
+    const light = new THREE.DirectionalLight(0xFFFFFF, 3);
+    light.position.set(-1, 2, 4);
+    
+    window.renderer.setSize(window.innerWidth, window.innerHeight);
+    window.renderer.shadowMap.enabled = true;
+    
+    window.scene.add(axesHelper);
+    window.scene.add(planeMesh);
+    window.scene.add(cube);
+    window.scene.add(light);
+    
+    cube.position.set(0, 0.5, 0);
+    
+    // Setup the composer and passes
+    setupPixelationPasses();
+    
+    containerRef.current.appendChild(window.renderer.domElement);
+    
+    // Add keyboard controls for the cube
+    document.addEventListener('keydown', (event) => {
+      switch (event.code) {
+        case "KeyW":
+          cube.position.x += 0.5;
+          break;
+        case "KeyA":
+          cube.position.z -= 0.5;
+          break;
+        case "KeyS":
+          cube.position.x -= 0.5;
+          break;
+        case "KeyD":
+          cube.position.z += 0.5;
+          break;
+        default:
+          break;
+      }
+    });
+    
+    // Handle window resize
+    const handleResize = () => {
+      const width = window.innerWidth;
+      const height = window.innerHeight;
+      
+      window.camera.left = -16;
+      window.camera.right = 16;
+      window.camera.top = 9;
+      window.camera.bottom = -9;
+      window.camera.updateProjectionMatrix();
+      
+      window.renderer.setSize(width, height);
+      
+      // Update render resolution
+      window.renderResolution.set(
+        Math.floor(width / pixelation.pixelSize),
+        Math.floor(height / pixelation.pixelSize)
+      );
+      
+      // Re-create passes with new resolution
+      setupPixelationPasses();
+    };
+    
+    window.addEventListener('resize', handleResize);
+    
+    const animation = () => {
+      requestAnimationFrame(animation);
+      window.camera.position.set(camera.pX, camera.pY, camera.pZ);
+      window.camera.rotation.set(camera.rX, camera.rY, camera.rZ);
+      planeMesh.rotation.set(position.x, position.y, position.z);
+      window.composer.render();
+    };
+    
+    animation();
+    
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      if (containerRef.current && window.renderer.domElement) {
+        containerRef.current.removeChild(window.renderer.domElement);
+      }
+    };
+  }, []);
+  
+  return (
+    <div ref={containerRef} className={styles.container} />
+  );
+}
